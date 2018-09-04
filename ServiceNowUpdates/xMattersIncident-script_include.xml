@@ -1,0 +1,550 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<unload unload_date="2018-08-18 19:56:36">
+<sys_script_include action="INSERT_OR_UPDATE">
+<access>public</access>
+<active>true</active>
+<api_name>x_xma_xmatters.xMattersIncident</api_name>
+<client_callable>false</client_callable>
+<description/>
+<name>xMattersIncident</name>
+<script><![CDATA[gs.include("xMattersConfig");
+gs.include('xMattersDataHelper');
+gs.include("xMattersEvent");
+gs.include("xMattersPerson");
+gs.include("xMattersGroup");
+
+var xMattersIncident = Class.create();
+
+xMattersIncident.prototype = {
+    /**
+     * Initialize the xMattersGroupMembership object
+     *
+     * @param {Object} config (optional) config object for the xMatters app; will default to xMattersConfig
+     * @param {Object} dataHelper data helper object; will default to xMattersDataHelper
+     * @param {string} logTraceId the context identifier under which to log messages
+     */
+    initialize: function (config, dataHelper, logTraceId) {
+        if (config && config.type == 'xMattersConfig') {
+            this.config = config;
+        } else {
+            this.config = new xMattersConfig();
+        }
+
+        this.log = new xMattersLogger(this.config.DEBUGGING, 'xMattersIncident', logTraceId);
+
+        if (dataHelper && dataHelper.type == 'xMattersDataHelper') {
+            this.dataHelper = dataHelper;
+        } else {
+            this.dataHelper = new xMattersDataHelper(this.config, this.log.getLogTraceId());
+        }
+
+        this.json = new global.JSON();
+    },
+
+    getXMPerson: function () {
+        if (typeof this.xmPerson === 'undefined' || this.xmPerson === null) {
+            this.xmPerson = new xMattersPerson(this.config, this.dataHelper);
+        }
+        return this.xmPerson;
+    },
+
+    getXMGroup: function () {
+        if (typeof this.xmGroup === 'undefined' || this.xmGroup === null) {
+            this.xmGroup = new xMattersGroup(this.config, this.dataHelper);
+        }
+        return this.xmGroup;
+    },
+
+    /**
+     * Condition for the "Insert" Incident Business Rule
+     * @param  {GlideRecord[Incident]}  incident the "current" incident glide record
+     * @return {Boolean}          Whether or not the Business Rule should fire
+     */
+    isInsertValid: function (incident) {
+        var shouldRun = true;
+        var reason;
+        if (!this.config.INCIDENT.ENABLED) {
+            reason = 'feature is disabled';
+            shouldRun = false;
+        } else {
+            this.log.debug('Priority: ' + incident.priority + ' || Valid Priorities: ' +
+                this.config.INCIDENT.VALID_PRIORITIES);
+            if (this.isIncidentPriorityValid(incident)) {
+                if (!this.isIncidentActive(incident)) {
+                    shouldRun = false;
+                    reason = 'Status is inactive based on configured inactive states | ' + incident.incident_state + ' IN ' +
+                        this.config.INCIDENT.INACTIVE_STATES;
+                }
+            } else {
+                shouldRun = false;
+                reason = 'Priority not in configured reasons | ' + incident.priority + ' !IN ' +
+                    this.config.INCIDENT.VALID_PRIORITIES;
+            }
+        }
+        if (!shouldRun) {
+            this.log.debug('isInsertValid: Bypassing Incident Business Rule | Reason: ' + reason);
+        }
+        return shouldRun;
+    },
+
+    /**
+     * Condition for the "Update" Incident Business Rule
+     * @param  {GlideRecord[Incident]}  incident  the "current" incident glide record
+     * @param  {GlideRecord[Incident]}  incident_prev  the "previous" incident glide record
+     * @return {Boolean}          Whether or not the Business Rule should fire
+     */
+    isUpdateValid: function (incident, incident_prev) {
+        var shouldRun = false;
+        if (!this.config.INCIDENT.ENABLED) {
+            reason = 'feature is disabled';
+        } else {
+            var criteria = this.getUpdateCriteria(incident, incident_prev);
+            reason = 'no incident condition was met';
+            if (criteria.isValidPriority) {
+                if (criteria.isActive) {
+					
+					//[xmLabs - Major Incident Management Enhancement - xMatters]
+					if (criteria.isAcceptedMajorIncident) {
+						if (criteria.isPriorityUpgrade || !criteria.wasActive ||
+							criteria.isSLAEscalation || criteria.isAssignment || !criteria.wasAcceptedMajorIncident) {
+							
+							shouldRun = true;
+							reason = '| CONDITION : met active |';
+						}
+					}					
+					//End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+					
+                } else if (criteria.wasActive) {
+                    shouldRun = true;
+                    reason = '| CONDITION : Closure |';
+                }
+            } else if (criteria.wasValidPriority) {
+                shouldRun = true;
+                reason = '| CONDITION : Priority Downgrade |';
+            } else {
+                reason = 'Priority not in configured priority | ' + incident.priority + ' !IN ' +
+                    this.config.INCIDENT.VALID_PRIORITIES;
+            }
+        }
+        if (!shouldRun) {
+            this.log.debug('isUpdateValid: Bypassing Incident Business Rule | Reason: ' + reason);
+        }
+        return shouldRun;
+    },
+
+    /**
+     * Logic for the "Update" Incident Business Rule -- will create an "assignment" incident event
+     * @param  {GlideRecord[Incident]}  incident  the "current" incident glide record
+     */
+    beforeInsert: function (incident) {
+        // Conditions have already run, just need to prep the insert event
+        var eventParameters = {
+            "terminate": false,
+            "sendEvent": true,
+            "triggerRule": this.config.INCIDENT.TRIGGER_RULES.ASSIGNMENT,
+            "userName": gs.getUserName()
+        };
+        this.log.debug("beforeInsert: Queuing event from incident insert business rule, eventParameters: " + this.json.encode(eventParameters));
+
+        if (!incident) {
+            this.log.debug('beforeInsert: "incident" parameter not set or null; using "current": ' + this.json.encode(current));
+            incident = current;
+        }
+        gs.eventQueue(this.getEventQueue(incident.number), incident, this.json.encode(eventParameters), 'incidentInsert');
+    },
+
+    /**
+     * Logic for the "Update" Incident Business Rule - Will conditionally create an incident event
+     * @param  {GlideRecord[Incident]}  incident  the "current" incident glide record
+     * @param  {GlideRecord[Incident]}  incident_prev  the "previous" incident glide record
+     */
+    beforeUpdate: function (incident, incident_prev) {
+        var triggerRule = '';
+        var eventParameters;
+        var criteria = this.getUpdateCriteria(incident, incident_prev);
+
+        if (criteria.isValidPriority) {
+            if (criteria.isActive) {
+				
+				//[xmLabs - Major Incident Management Enhancement - xMatters]
+				if (criteria.isAcceptedMajorIncident) {
+				//End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+					
+					if (criteria.isPriorityUpgrade) { // Priority escalation
+						triggerRule = this.config.INCIDENT.TRIGGER_RULES.PRIORITY_UPGRADE;
+					} else if (!criteria.wasActive) { // Reopen
+						triggerRule = this.config.INCIDENT.TRIGGER_RULES.REOPENED;
+					} else if (criteria.isSLAEscalation) { // SLA Alert
+						triggerRule = this.config.INCIDENT.TRIGGER_RULES.SLA_ALERT;
+					} else if (criteria.isAssignment) { // assignee/group flow
+						triggerRule = this.config.INCIDENT.TRIGGER_RULES.ASSIGNMENT;
+					} 
+					//[xmLabs - Major Incident Management Enhancement - xMatters]
+					else if (criteria.wasAcceptedMajorIncident == false && criteria.isAcceptedMajorIncident == true) { // Major Incident confirmed
+				       triggerRule = this.config.INCIDENT.TRIGGER_RULES.MAJOR_INCIDENT_ACCEPTED;
+				    }
+					//End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+										
+					if (triggerRule !== '') {
+						eventParameters = {
+							triggerRule: triggerRule,
+							terminate: true,
+							sendEvent: true
+						};
+					}
+					
+					
+				//[xmLabs - Major Incident Management Enhancement - xMatters]
+				}
+				//End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+
+				
+            } else if (criteria.wasActive) { // Issue resolved
+                eventParameters = {
+                    triggerRule: this.config.INCIDENT.TRIGGER_RULES.DELETE,
+                    terminate: true,
+                    sendEvent: false
+                };
+				
+            }
+        } else if (criteria.wasValidPriority) { // Priority decreased
+            eventParameters = {
+                triggerRule: this.config.INCIDENT.TRIGGER_RULES.DELETE,
+                terminate: true,
+                sendEvent: false
+            };
+
+        }
+		
+        if (typeof eventParameters !== 'undefined' && eventParameters !== null) {
+            eventParameters.userName = gs.getUserName();
+            this.log.debug("beforeUpdate: Queuing event from incident update business rule, eventParameters: " + this.json.encode(eventParameters));
+
+            if (!incident) {
+                this.log.debug('beforeUpdate: "incident" parameter not set or null; using "current": ' + this.json.encode(current));
+                incident = current;
+            }
+            gs.eventQueue(this.getEventQueue(incident.number), incident, this.json.encode(eventParameters), 'incidentUpdate');
+        }
+    },
+
+    /**
+     * Gets a view of the state of the current record based on the different business rule
+     * criteria.
+     * @param  {GlideRecord[Incident]}  incident  the "current" incident glide record
+     * @param  {GlideRecord[Incident]}  incident_prev  the "previous" incident glide record
+     * @return {Object}          Returns an object with information about the state of the current incident
+     *                                and what type of conditions/criteria are being met
+     */
+    getUpdateCriteria: function (incident, incident_prev) {
+        var criteria = {
+			//[xmLabs - Major Incident Management Enhancement - xMatters]
+			isAcceptedMajorIncident: this.isAcceptedMajorIncident(incident),
+			wasAcceptedMajorIncident: this.isAcceptedMajorIncident(incident_prev),
+			//End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+
+            isValidPriority: this.isIncidentPriorityValid(incident),
+            wasValidPriority: this.isIncidentPriorityValid(incident_prev),
+            isActive: this.isIncidentActive(incident),
+            wasActive: this.isIncidentActive(incident_prev),
+        };
+        if (criteria.isValidPriority && criteria.isActive) {
+            criteria.isPriorityUpgrade = incident.priority < incident_prev.priority;
+            criteria.isSLAEscalation = incident.escalation.changes() && incident.escalation > incident_prev.escalation &&
+                incident_prev.escalation != -1;
+			criteria.isAssignment = (incident.assigned_to.changes() && !incident.assigned_to.nil()) ||
+                (!incident.assignment_group.nil() && (incident.assigned_to.changes() || incident.assignment_group.changes()));
+				
+        }
+
+        this.log.debug('getUpdateCriteria: Criteria: ' + global.JSON.stringify(criteria));
+        return criteria;
+    },
+    
+	//[xmLabs - Major Incident Management Enhancement - xMatters]
+	isAcceptedMajorIncident : function(incidentRec){
+		return (incidentRec.major_incident_state == 'accepted');
+	},
+    //End Changes [xmLabs - Major Incident Management Enhancement - xMatters]
+
+    /**
+     * Convenience method to compare the incident to configured inactive states
+     * @param  {GlideRecord[Incident]}  incident an incident glide record
+     * @return {Boolean}          Whether or not the incident is active
+     */
+    isIncidentActive: function (incidentRec) {
+        return this.config.INCIDENT.INACTIVE_STATES.indexOf(incidentRec.incident_state) < 0;
+    },
+
+    /**
+     * Convenience method to compare the incident to configured valid xm priorities
+     * @param  {GlideRecord[Incident]}  incident an incident glide record
+     * @return {Boolean}          Whether or not the incident has a valid priority
+     */
+    isIncidentPriorityValid: function (incidentRec) {
+        return this.config.INCIDENT.VALID_PRIORITIES.indexOf(incidentRec.priority) >= 0;
+    },
+
+    /**
+     * Calculate the event queue based on the incident number. This is essentially used to load balance
+     * @param number - The Incident number. The last digit is inspected to determine which queue to send to
+     */
+    getEventQueue: function (number) {
+        var eventQueueName = this.config.INCIDENT.EVENT_QUEUE_BASE + '.';
+        var lastDigit = number % 10;
+        if (lastDigit < 3) {
+            eventQueueName += 'A';
+        } else if (lastDigit < 6) {
+            eventQueueName += 'B';
+        } else {
+            eventQueueName += 'C';
+        }
+        return eventQueueName;
+    },
+
+    /**
+     * Handles incident action(s)
+     * @param record current record
+     * @param parms an object describing actions to be performed
+     */
+    handleIncidentAction: function (record, parms) {
+        try {
+            this.log.debug("handleIncidentAction: Incident " + record.number + " with parameters " + this.json.encode(parms));
+            var notes = [];
+            if (parms.terminate) {
+                this.log.debug('handleIncidentAction: In terminate events!');
+                notes.push(this.deleteIncident(record, parms.triggerRule));
+            }
+            if (parms.sendEvent) {
+                this.log.debug('handleIncidentAction: In send event!');
+                var note = this.addIncident(record, parms.triggerRule, parms.userName);
+                if (note !== null && note.length > 0) {
+                    notes.push(note);
+                }
+            }
+
+            this.log.debug('handleIncidentAction: Notes: ' + notes);
+
+            // create the final work notes if the notes array has items to be added to the work notes
+            if (notes.length > 0) {
+                record.work_notes = notes.join("\n");
+                record.update();
+            }
+
+        } catch (e) {
+            this.log.logException('handleIncidentAction', e);
+            throw e;
+        }
+    },
+
+    /**
+     * Safely puts some commonly used incident values in an object for
+     * future use
+     *
+     * @param  {GlideRecord[incident]} record
+     *         The incident you want to create a model for
+     * @return {Object}
+     *         An object with the following properties: {
+   *           "assignee":      incident assigned to user name
+   *           "assigneeUser":  GlideRecord of user if queried or user
+   *           "group":         incident assignment group name
+   *           "priority":      incident priority
+   *           "number":        incident number
+   *         }
+     */
+    getIncidentModel: function (record) {
+        var incident = {
+            priority: record.priority.getDisplayValue(),
+            number: record.number.getDisplayValue()
+        };
+
+        if (!gs.nil(record.assigned_to)) {
+            if (this.config.USERNAMEFIELD === 'user_name') {
+                incident.assignee = record.assigned_to.user_name.getDisplayValue();
+                incident.assigneeUser = record.assigned_to.user_name.getDisplayValue();
+            } else {
+                // Retrieve the user in order to grab the correct field for the xMatters username
+                var user = new GlideRecord('sys_user');
+                user.get(record.assigned_to);
+                incident.assignee = this.getXMPerson().getxMattersUsername(user);
+                incident.assigneeUser = user;
+            }
+        } else {
+            incident.assignee = '';
+        }
+
+        if (!gs.nil(record.assignment_group)) {
+            incident.group = record.assignment_group.name.getDisplayValue();
+        } else {
+            incident.group = '';
+        }
+
+        this.log.debug('getIncidentModel: Incident Model: ' + this.json.encode(incident));
+        return incident;
+    },
+
+    /**
+     * Gets the recipients for an incident and tests whether or not the recipients are
+     * valid
+     * @param  {Object[incidentModel]} incidentModel Should be the response of the getIncidentModel function
+     * @param  {string} currentUser   Username of the current user
+     * @return {Object}               An object representing the incident's event recipients:
+     *                                   {
+   *                                     isValid:  true if the recipients can be sent to within xMatters
+   *                                     invalidReason: a text reason for why there are no valid recipients
+   *                                     recipients:  array of strings for the recipients of the event
+   *                                     isIndividual: true if the recipients are individuals or false for groups
+   *                                   }
+     */
+    getRecipients: function (incidentModel, currentUser) {
+        var response = {
+            noRecipientReason: '',
+            recipients: [],
+            isIndividual: false,
+            suppress: false
+        };
+
+        this.log.debug('getRecipients: Assignee: |' + incidentModel.assignee +
+            '| group: |' + incidentModel.group +
+            '| current user: |' + currentUser +
+            '| api.user: |' + this.config.SNAPI.user + '|');
+
+        if (incidentModel.assignee !== '') {
+            if (currentUser === this.config.SNAPI.user) {
+                response.noRecipientReason = 'Current user is the service now api user (' + currentUser + ') and individual notification will be ignored.';
+                response.suppress = true;
+            } else if (this.config.INCIDENT.SUPPRESS_ASSIGN_SELF && currentUser === incidentModel.assignee) {
+                response.noRecipientReason = 'Assignee user is the current user';
+                response.suppress = true;
+            } else if (!this.config.INCIDENT.SEND_TO_SYNCED_ONLY) {
+                this.log.debug('getRecipients: Assuming individual is valid due to config');
+                response.recipients.push(incidentModel.assignee);
+                response.isIndividual = true;
+            } else if (this.getXMPerson().isSyncableUser(incidentModel.assigneeUser)) {
+                this.log.debug('getRecipients: Confirmed user is valid via role');
+                response.recipients.push(incidentModel.assignee);
+                response.isIndividual = true;
+            } else {
+                response.noRecipientReason = 'Assignee user is not synced to xMatters';
+            }
+        } else if (incidentModel.group !== '') {
+            if (!this.config.INCIDENT.SEND_TO_SYNCED_ONLY) {
+                this.log.debug('getRecipients: Assuming group is valid due to config');
+                response.recipients.push(incidentModel.group);
+				
+            } else if (this.getXMGroup().isSyncableGroup(incidentModel.group)) {
+                this.log.debug('getRecipients: Confirmed group is valid via role');
+                response.recipients.push(incidentModel.group);
+				
+            } else {
+                response.noRecipientReason = 'Assignment Group is not synced to xMatters';
+            }
+        } else {
+            response.noRecipientReason = 'No assignee or assignment group';
+        }
+        if (response.recipients.length > 0) {
+            response.isValid = true;
+            this.log.debug('getRecipients: Found valid Recipients: |' + response.recipients.join(',') + '| isIndividual: |' + response.isIndividual);
+        } else {
+            response.isValid = false;
+            // Added for suppression overrides based on current user
+            response.suppress = this.config.INCIDENT.SUPPRESS_NO_RECIPIENT || response.suppress;
+            this.log.debug('getRecipients: No recipients - Reason: ' + response.noRecipientReason + ' | Suppress? ' + response.suppress);
+        }
+
+        return response;
+    },
+
+     /**
+     * Adds an incident to the xMatters (alarmpoint) Engine
+     * @param record current record
+     * @param triggerRule String containing the trigger rule
+     * @param userName name of the current user
+     */
+    addIncident: function (record, triggerRule, userName) {
+        var xmEvent = new xMattersEvent(this.config, this.dataHelper);
+        var incident = this.getIncidentModel(record);
+
+        var recipientModel = this.getRecipients(incident, userName);
+        if (recipientModel.isValid) {
+            for (var i = 0; i < recipientModel.recipients.length; i++) {
+                xmEvent.addRecipient(recipientModel.recipients[i]);
+            }
+            if (recipientModel.isIndividual) {
+                xmEvent.setResponses(this.config.INCIDENT.RESPONSES.INDIVIDUAL);
+            } else {
+                xmEvent.setResponses(this.config.INCIDENT.RESPONSES.GROUP);
+            }
+        } else if (!recipientModel.suppress) {
+            this.log.debug('addIncident: Attempting to submit form without recipients');
+            xmEvent.setResponses(this.config.INCIDENT.RESPONSES.GROUP);
+        } else {
+            return '[xMatters] - Skipping notification | Reason: ' + recipientModel.noRecipientReason + '|';
+        }
+
+        xmEvent.setWebserviceURL(this.config.INCIDENT.FORM);
+        if (incident.priority === this.config.INCIDENT.CRITICAL_PRIORITY) {
+            this.log.debug('addIncident: Setting priority to high [' + incident.priority + ']=[' +
+                this.config.INCIDENT.CRITICAL_PRIORITY + ']');
+            xmEvent.setPriority(this.config.PRIORITY.HIGH);
+        } else {
+            this.log.debug('addIncident: Setting priority to medium [' + incident.priority + ']![' +
+                this.config.INCIDENT.CRITICAL_PRIORITY + ']');
+            xmEvent.setPriority(this.config.PRIORITY.MEDIUM);
+        }
+
+        // Add Incident Properties
+        xmEvent.addAllIncidentProperties(record);
+
+        // Add configuration item list if configured to do so
+        if (this.config.INCIDENT.SEND_CONFIGURATION_ITEM_LIST) {
+            var xmprops = new xMattersProperties(this.config),
+                ci = record.cmdb_ci.getDisplayValue();
+            if (xmprops.isSyncableCI(ci)) {
+                xmEvent.addProperty('configuration_item_list', ci);
+            } else {
+                this.log.debug('addIncident: We are not concerned with CI, "' + ci + '"');
+            }
+        }
+
+        // Add other properties
+        xmEvent.addProperty('trigger', triggerRule);
+        xmEvent.addProperty('servicenowurl', this.config.SNAPI.hostname);
+        xmEvent.addProperty('xmatters_url', this.config.XMAPI.hostname);
+
+        this.log.debug("addIncident: Attempting to inject an xMatters event for incident " + incident.number + " " + triggerRule);
+        xmEvent.send();
+        var notes = xmEvent.getEventNotes();
+        return notes;
+    },
+
+    /**
+     * Terminates an incident in the xMatters (alarmpoint) Engine
+     * @param record current record
+     * @param triggerRule String containing the trigger rule
+     */
+    deleteIncident: function (record, triggerRule) {
+        // Terminate the related events in xMatters
+        try {
+            (new xMattersEvent(this.config, this.dataHelper)).terminateEvents('number',
+                String(record.number));
+            return "[xMatters] - Terminated existing events for this Incident";
+        } catch (e) {
+            return "[xMatters] - Injected termination event FAILED for " + triggerRule;
+        }
+    }
+};]]></script>
+<sys_class_name>sys_script_include</sys_class_name>
+<sys_created_by>admin</sys_created_by>
+<sys_created_on>2015-02-09 19:56:27</sys_created_on>
+<sys_id>299205cb7b02f1008e0b707d784d4db4</sys_id>
+<sys_mod_count>61</sys_mod_count>
+<sys_name>xMattersIncident</sys_name>
+<sys_package display_value="xMatters" source="x_xma_xmatters">5950d7444f2231000e9fa88ca310c78c</sys_package>
+<sys_policy/>
+<sys_scope display_value="xMatters">5950d7444f2231000e9fa88ca310c78c</sys_scope>
+<sys_update_name>sys_script_include_299205cb7b02f1008e0b707d784d4db4</sys_update_name>
+<sys_updated_by>admin</sys_updated_by>
+<sys_updated_on>2018-08-18 19:48:35</sys_updated_on>
+</sys_script_include>
+</unload>
